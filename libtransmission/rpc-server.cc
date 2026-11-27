@@ -372,20 +372,20 @@ void handle_web_client(struct evhttp_request* req, tr_rpc_server const* server)
 
 void handle_rpc_from_json(struct evhttp_request* req, tr_rpc_server* server, std::string_view json)
 {
-    tr_rpc_request_exec(
+    tr_rpc_request_exec_json(
         server->session,
         json,
         // NOLINTNEXTLINE(cppcoreguidelines-rvalue-reference-param-not-moved)
-        [req, server](tr_variant&& content)
+        [req, server](std::string&& content)
         {
-            if (!content.has_value())
+            if (std::empty(content))
             {
                 evhttp_send_reply(req, HTTP_NOCONTENT, "OK", nullptr);
                 return;
             }
 
             auto* const output_headers = evhttp_request_get_output_headers(req);
-            auto* const response = make_response(req, server, tr_variant_serde::json().compact().to_string(content));
+            auto* const response = make_response(req, server, content);
             evhttp_add_header(output_headers, "Content-Type", "application/json; charset=UTF-8");
             evhttp_send_reply(req, HTTP_OK, "OK", response);
             evbuffer_free(response);
