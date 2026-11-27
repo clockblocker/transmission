@@ -119,6 +119,7 @@ target_sources(${TR_NAME}
         quark.h
         resume.cc
         resume.h
+        rpc-schema.h
         rpc-server.cc
         rpc-server.h
         rpcimpl.cc
@@ -299,6 +300,7 @@ target_link_libraries(${TR_NAME}
         "$<$<BOOL:${ANDROID}>:${log-lib}>"
         $<$<BOOL:${HAVE_LIBATOMIC}>:atomic>
     PUBLIC
+        reflectcpp
         transmission::crypto_impl
         transmission::fmt-header-only
         Pal::Sigslot

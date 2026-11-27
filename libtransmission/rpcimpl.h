@@ -7,6 +7,8 @@
 
 #include <cstdint> // int16_t
 #include <functional>
+#include <string>
+#include <string_view>
 
 struct tr_session;
 struct tr_variant;
@@ -50,7 +52,10 @@ enum Code : int16_t
 } // namespace JsonRpc
 
 using tr_rpc_response_func = std::function<void(tr_variant&& response)>;
+using tr_rpc_json_response_func = std::function<void(std::string&& response_json)>;
 
 void tr_rpc_request_exec(tr_session* session, tr_variant& request, tr_rpc_response_func&& callback = {});
 
 void tr_rpc_request_exec(tr_session* session, std::string_view request, tr_rpc_response_func&& callback = {});
+
+void tr_rpc_request_exec_json(tr_session* session, std::string_view request, tr_rpc_json_response_func&& callback = {});
