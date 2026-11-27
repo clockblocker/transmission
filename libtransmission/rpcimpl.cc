@@ -27,9 +27,7 @@
 #include <libdeflate.h>
 
 #include <rfl.hpp>
-#include <rfl/from_generic.hpp>
 #include <rfl/json.hpp>
-#include <rfl/to_generic.hpp>
 
 #include "libtransmission/transmission.h"
 
@@ -108,86 +106,7 @@ namespace Error
     }
 }
 
-namespace
-{
-[[nodiscard]] tr_variant::Map build_data(std::string_view error_string, tr_variant::Map&& result)
-{
-    auto ret = tr_variant::Map{ 2U };
-
-    if (!std::empty(error_string))
-    {
-        ret.try_emplace(TR_KEY_error_string, error_string);
-    }
-
-    if (!std::empty(result))
-    {
-        ret.try_emplace(TR_KEY_result, std::move(result));
-    }
-
-    return ret;
-}
-
-[[nodiscard]] tr_variant::Map build(Code code, tr_variant::Map&& data)
-{
-    auto ret = tr_variant::Map{ 3U };
-    ret.try_emplace(TR_KEY_code, code);
-    ret.try_emplace(TR_KEY_message, tr_variant::unmanaged_string(to_string(code)));
-    if (!std::empty(data))
-    {
-        ret.try_emplace(TR_KEY_data, std::move(data));
-    }
-
-    return ret;
-}
-} // namespace
 } // namespace Error
-
-namespace
-{
-[[nodiscard]] constexpr bool is_valid_id(tr_variant const& val)
-{
-    switch (val.index())
-    {
-    // https://www.jsonrpc.org/specification#request_object
-    // An identifier established by the Client that MUST contain a String,
-    // Number, or NULL value if included. .. The value SHOULD normally not
-    // be Null and Numbers SHOULD NOT contain fractional parts
-    case tr_variant::StringIndex:
-    case tr_variant::StringViewIndex:
-    case tr_variant::IntIndex:
-    case tr_variant::DoubleIndex:
-    case tr_variant::NullIndex:
-        return true;
-
-    default:
-        return false;
-    }
-}
-
-// https://www.jsonrpc.org/specification#response_object
-[[nodiscard]] tr_variant::Map build_response(Error::Code code, tr_variant id, tr_variant::Map&& body, bool is_jsonrpc = true)
-{
-    if (is_jsonrpc && !is_valid_id(id))
-    {
-        TR_ASSERT(false);
-        id = nullptr;
-    }
-
-    auto ret = tr_variant::Map{ 3U };
-    ret.try_emplace(TR_KEY_jsonrpc, tr_variant::unmanaged_string(Version));
-    if (code == Error::SUCCESS)
-    {
-        ret.try_emplace(TR_KEY_result, std::move(body));
-    }
-    else
-    {
-        ret.try_emplace(TR_KEY_error, Error::build(code, std::move(body)));
-    }
-    ret.try_emplace(TR_KEY_id, std::move(id));
-
-    return ret;
-}
-} // namespace
 } // namespace JsonRpc
 
 namespace
@@ -217,228 +136,59 @@ enum class TrFormat : uint8_t
  * when the task is complete */
 struct tr_rpc_idle_data
 {
-    tr_variant id;
     tr::rpc::RequestId rpc_id = tr::rpc::RequestId::omitted();
     tr_session* session = nullptr;
-    tr_variant::Map args_out;
-    tr_rpc_response_func callback;
+    std::string result_json;
+    std::optional<tr::rpc::IpProtocol> port_test_ip_protocol;
     tr_rpc_json_response_func json_callback;
-
-    // TODO: api-compat
-    bool is_jsonrpc = false;
 };
 
 void tr_rpc_idle_done(struct tr_rpc_idle_data* data, JsonRpc::Error::Code code, std::string_view errmsg)
 {
     using namespace JsonRpc;
 
-    if (data->json_callback)
+    if (data->rpc_id.is_notification())
     {
-        if (data->is_jsonrpc)
-        {
-            if (data->rpc_id.is_notification())
-            {
-                data->json_callback(std::string{});
-            }
-            else if (code == Error::SUCCESS)
-            {
-                auto result_json = tr_variant_serde::json().compact().to_string(tr_variant{ std::move(data->args_out) });
-                data->json_callback(build_json_success_response(data->rpc_id, rfl::json::Raw{ std::move(result_json) }));
-            }
-            else
-            {
-                auto partial = std::optional<rfl::json::Raw>{};
-                if (!std::empty(data->args_out))
-                {
-                    partial = rfl::json::Raw{ tr_variant_serde::json().compact().to_string(
-                        tr_variant{ std::move(data->args_out) }) };
-                }
-                data->json_callback(build_json_error_response(code, data->rpc_id, errmsg, std::move(partial)));
-            }
-        }
-        else
-        {
-            auto const is_success = code == Error::SUCCESS;
-            auto response = tr_variant{ build_response(
-                code,
-                std::move(data->id),
-                is_success ? std::move(data->args_out) : Error::build_data(errmsg, std::move(data->args_out)),
-                false) };
-            tr::api_compat::convert(response, tr::api_compat::Style::Tr4);
-            data->json_callback(tr_variant_serde::json().compact().to_string(response));
-        }
+        data->json_callback(std::string{});
     }
-    else if (!data->is_jsonrpc || data->id.has_value())
+    else if (code == Error::SUCCESS)
     {
-        auto const is_success = code == Error::SUCCESS;
-        auto response = tr_variant{ build_response(
-            code,
-            std::move(data->id),
-            is_success ? std::move(data->args_out) : Error::build_data(errmsg, std::move(data->args_out)),
-            data->is_jsonrpc) };
-        if (!data->is_jsonrpc)
-        {
-            tr::api_compat::convert(response, tr::api_compat::Style::Tr4);
-        }
-        data->callback(std::move(response));
+        auto raw = std::empty(data->result_json) ? rfl::json::Raw{ "{}" } : rfl::json::Raw{ std::move(data->result_json) };
+        data->json_callback(build_json_success_response(data->rpc_id, std::move(raw)));
     }
-    else // notification
+    else
     {
-        data->callback({});
+        auto partial = std::optional<rfl::json::Raw>{};
+        if (!std::empty(data->result_json))
+        {
+            partial = rfl::json::Raw{ std::move(data->result_json) };
+        }
+        data->json_callback(build_json_error_response(code, data->rpc_id, errmsg, std::move(partial)));
     }
 
     delete data;
 }
 
-// --- reflect-cpp <-> tr_variant interop helpers ---
+// --- reflect-cpp JSON-RPC helpers ---
 
-[[nodiscard]] rfl::Generic tr_variant_to_rfl_generic(tr_variant const& var)
+template<typename T>
+[[nodiscard]] rfl::Result<T> parse_rpc_params(std::string_view const raw_params)
 {
-    switch (var.index())
-    {
-    case tr_variant::NullIndex:
-    case tr_variant::NoneIndex:
-        return rfl::Generic{};
-
-    case tr_variant::BoolIndex:
-        return rfl::Generic{ *var.get_if<tr_variant::BoolIndex>() };
-
-    case tr_variant::IntIndex:
-        return rfl::Generic{ *var.get_if<tr_variant::IntIndex>() };
-
-    case tr_variant::DoubleIndex:
-        return rfl::Generic{ *var.get_if<tr_variant::DoubleIndex>() };
-
-    case tr_variant::StringIndex:
-    case tr_variant::StringViewIndex:
-        return rfl::Generic{ std::string{ *var.value_if<std::string_view>() } };
-
-    case tr_variant::VectorIndex:
-        {
-            auto const& src = *var.get_if<tr_variant::Vector>();
-            auto arr = rfl::Generic::Array{};
-            arr.reserve(std::size(src));
-            for (auto const& elem : src)
-            {
-                arr.emplace_back(tr_variant_to_rfl_generic(elem));
-            }
-            return rfl::Generic{ std::move(arr) };
-        }
-
-    case tr_variant::MapIndex:
-        {
-            auto const& src = *var.get_if<tr_variant::Map>();
-            auto obj = rfl::Generic::Object{};
-            for (auto const& [key, val] : src)
-            {
-                obj.insert(std::string{ tr_quark_get_string_view(key) }, tr_variant_to_rfl_generic(val));
-            }
-            return rfl::Generic{ std::move(obj) };
-        }
-
-    default:
-        return rfl::Generic{};
-    }
-}
-
-[[nodiscard]] rfl::Generic tr_variant_map_to_rfl_generic(tr_variant::Map const& map)
-{
-    auto obj = rfl::Generic::Object{};
-    for (auto const& [key, val] : map)
-    {
-        obj.insert(std::string{ tr_quark_get_string_view(key) }, tr_variant_to_rfl_generic(val));
-    }
-    return rfl::Generic{ std::move(obj) };
-}
-
-[[nodiscard]] tr_variant rfl_generic_to_tr_variant(rfl::Generic const& g)
-{
-    return std::visit(
-        [](auto const& val) -> tr_variant
-        {
-            using T = std::decay_t<decltype(val)>;
-            if constexpr (std::is_same_v<T, std::nullopt_t>)
-            {
-                return nullptr;
-            }
-            else if constexpr (std::is_same_v<T, bool> || std::is_same_v<T, int64_t> || std::is_same_v<T, double>)
-            {
-                return val;
-            }
-            else if constexpr (std::is_same_v<T, std::string>)
-            {
-                return tr_variant{ val };
-            }
-            else if constexpr (std::is_same_v<T, rfl::Generic::Array>)
-            {
-                auto vec = tr_variant::Vector{};
-                vec.reserve(std::size(val));
-                for (auto const& elem : val)
-                {
-                    vec.emplace_back(rfl_generic_to_tr_variant(elem));
-                }
-                return tr_variant{ std::move(vec) };
-            }
-            else if constexpr (std::is_same_v<T, rfl::Generic::Object>)
-            {
-                auto map = tr_variant::Map{ std::size(val) };
-                for (auto const& [k, v] : val)
-                {
-                    map.try_emplace(tr_quark_new(k), rfl_generic_to_tr_variant(v));
-                }
-                return tr_variant{ std::move(map) };
-            }
-        },
-        g.variant());
+    return rfl::json::read<T>(std::empty(raw_params) ? "{}"sv : raw_params);
 }
 
 template<typename T>
-[[nodiscard]] rfl::Result<T> parse_rpc_params(tr_variant::Map const& args_in)
+void write_rpc_result(T const& res, std::string& result_json)
 {
-    return rfl::from_generic<T>(tr_variant_map_to_rfl_generic(args_in));
+    result_json = rfl::json::write(res);
 }
 
-template<typename T>
-void write_rpc_result(T const& res, tr_variant::Map& args_out)
-{
-    auto g = rfl::to_generic(res);
-    if (auto const* obj = std::get_if<rfl::Generic::Object>(&g.variant()); obj != nullptr)
-    {
-        args_out.reserve(std::size(args_out) + std::size(*obj));
-        for (auto const& [k, v] : *obj)
-        {
-            args_out.try_emplace(tr_quark_new(k), rfl_generic_to_tr_variant(v));
-        }
-    }
-}
-
+// Local helper for dynamic field projection in torrentGet / sessionGet
 template<typename T>
 [[nodiscard]] tr_variant to_tr_variant(T const& value)
 {
-    return rfl_generic_to_tr_variant(rfl::to_generic(value));
-}
-
-[[nodiscard]] tr_variant request_id_to_tr_variant(tr::rpc::RequestId const& id)
-{
-    if (!id.present)
-    {
-        return {};
-    }
-
-    return std::visit(
-        [](auto const& v) -> tr_variant
-        {
-            using T = std::decay_t<decltype(v)>;
-            if constexpr (std::is_same_v<T, std::nullptr_t>)
-            {
-                return nullptr;
-            }
-            else
-            {
-                return tr_variant{ v };
-            }
-        },
-        id.value);
+    auto serde = tr_variant_serde::json().inplace();
+    return serde.parse(rfl::json::write(value)).value_or(tr_variant{});
 }
 
 [[nodiscard]] std::string build_json_error_response(
@@ -566,8 +316,8 @@ void notifyBatchQueueChange(tr_session* session, std::vector<tr_torrent*> const&
 
 [[nodiscard]] std::pair<JsonRpc::Error::Code, std::string> queueMoveTop(
     tr_session* session,
-    tr_variant::Map const& args_in,
-    tr_variant::Map& /*args_out*/)
+    std::string_view args_in,
+    std::string& /*args_out*/)
 {
     auto const params = parse_rpc_params<tr::rpc::TorrentActionParams>(args_in);
     if (!params)
@@ -582,8 +332,8 @@ void notifyBatchQueueChange(tr_session* session, std::vector<tr_torrent*> const&
 
 [[nodiscard]] std::pair<JsonRpc::Error::Code, std::string> queueMoveUp(
     tr_session* session,
-    tr_variant::Map const& args_in,
-    tr_variant::Map& /*args_out*/)
+    std::string_view args_in,
+    std::string& /*args_out*/)
 {
     auto const params = parse_rpc_params<tr::rpc::TorrentActionParams>(args_in);
     if (!params)
@@ -598,8 +348,8 @@ void notifyBatchQueueChange(tr_session* session, std::vector<tr_torrent*> const&
 
 [[nodiscard]] std::pair<JsonRpc::Error::Code, std::string> queueMoveDown(
     tr_session* session,
-    tr_variant::Map const& args_in,
-    tr_variant::Map& /*args_out*/)
+    std::string_view args_in,
+    std::string& /*args_out*/)
 {
     auto const params = parse_rpc_params<tr::rpc::TorrentActionParams>(args_in);
     if (!params)
@@ -614,8 +364,8 @@ void notifyBatchQueueChange(tr_session* session, std::vector<tr_torrent*> const&
 
 [[nodiscard]] std::pair<JsonRpc::Error::Code, std::string> queueMoveBottom(
     tr_session* session,
-    tr_variant::Map const& args_in,
-    tr_variant::Map& /*args_out*/)
+    std::string_view args_in,
+    std::string& /*args_out*/)
 {
     auto const params = parse_rpc_params<tr::rpc::TorrentActionParams>(args_in);
     if (!params)
@@ -630,8 +380,8 @@ void notifyBatchQueueChange(tr_session* session, std::vector<tr_torrent*> const&
 
 [[nodiscard]] std::pair<JsonRpc::Error::Code, std::string> torrentStart(
     tr_session* session,
-    tr_variant::Map const& args_in,
-    tr_variant::Map& /*args_out*/)
+    std::string_view args_in,
+    std::string& /*args_out*/)
 {
     auto const params = parse_rpc_params<tr::rpc::TorrentActionParams>(args_in);
     if (!params)
@@ -654,8 +404,8 @@ void notifyBatchQueueChange(tr_session* session, std::vector<tr_torrent*> const&
 
 [[nodiscard]] std::pair<JsonRpc::Error::Code, std::string> torrentStartNow(
     tr_session* session,
-    tr_variant::Map const& args_in,
-    tr_variant::Map& /*args_out*/)
+    std::string_view args_in,
+    std::string& /*args_out*/)
 {
     auto const params = parse_rpc_params<tr::rpc::TorrentActionParams>(args_in);
     if (!params)
@@ -678,8 +428,8 @@ void notifyBatchQueueChange(tr_session* session, std::vector<tr_torrent*> const&
 
 [[nodiscard]] std::pair<JsonRpc::Error::Code, std::string> torrentStop(
     tr_session* session,
-    tr_variant::Map const& args_in,
-    tr_variant::Map& /*args_out*/)
+    std::string_view args_in,
+    std::string& /*args_out*/)
 {
     auto const params = parse_rpc_params<tr::rpc::TorrentActionParams>(args_in);
     if (!params)
@@ -700,8 +450,8 @@ void notifyBatchQueueChange(tr_session* session, std::vector<tr_torrent*> const&
 
 [[nodiscard]] std::pair<JsonRpc::Error::Code, std::string> torrentRemove(
     tr_session* session,
-    tr_variant::Map const& args_in,
-    tr_variant::Map& /*args_out*/)
+    std::string_view args_in,
+    std::string& /*args_out*/)
 {
     auto const params = parse_rpc_params<tr::rpc::TorrentRemoveParams>(args_in);
     if (!params)
@@ -725,8 +475,8 @@ void notifyBatchQueueChange(tr_session* session, std::vector<tr_torrent*> const&
 
 [[nodiscard]] std::pair<JsonRpc::Error::Code, std::string> torrentReannounce(
     tr_session* session,
-    tr_variant::Map const& args_in,
-    tr_variant::Map& /*args_out*/)
+    std::string_view args_in,
+    std::string& /*args_out*/)
 {
     auto const params = parse_rpc_params<tr::rpc::TorrentActionParams>(args_in);
     if (!params)
@@ -747,8 +497,8 @@ void notifyBatchQueueChange(tr_session* session, std::vector<tr_torrent*> const&
 
 [[nodiscard]] std::pair<JsonRpc::Error::Code, std::string> torrentVerify(
     tr_session* session,
-    tr_variant::Map const& args_in,
-    tr_variant::Map& /*args_out*/)
+    std::string_view args_in,
+    std::string& /*args_out*/)
 {
     auto const params = parse_rpc_params<tr::rpc::TorrentActionParams>(args_in);
     if (!params)
@@ -1321,8 +1071,8 @@ namespace make_torrent_field_helpers
 
 [[nodiscard]] std::pair<JsonRpc::Error::Code, std::string> torrentGet(
     tr_session* session,
-    tr_variant::Map const& args_in,
-    tr_variant::Map& args_out)
+    std::string_view args_in,
+    std::string& result_json)
 {
     using namespace JsonRpc;
 
@@ -1331,6 +1081,8 @@ namespace make_torrent_field_helpers
     {
         return { tr::rpc::classify_params_error(params.error().kind()), params.error().what() };
     }
+
+    auto args_out = tr_variant::Map{};
 
     auto const torrents = getTorrents(session, params->ids.value());
     auto torrents_vec = tr_variant::Vector{};
@@ -1390,6 +1142,7 @@ namespace make_torrent_field_helpers
     }
 
     args_out.try_emplace(TR_KEY_torrents, std::move(torrents_vec));
+    result_json = tr_variant_serde::json().compact().to_string(tr_variant{ std::move(args_out) });
     return { Error::SUCCESS, std::string{} }; // no error message
 }
 
@@ -1584,8 +1337,8 @@ namespace make_torrent_field_helpers
 
 [[nodiscard]] std::pair<JsonRpc::Error::Code, std::string> torrentSet(
     tr_session* session,
-    tr_variant::Map const& args_in,
-    tr_variant::Map& /*args_out*/)
+    std::string_view args_in,
+    std::string& /*args_out*/)
 {
     using namespace JsonRpc;
 
@@ -1740,8 +1493,8 @@ namespace make_torrent_field_helpers
 
 [[nodiscard]] std::pair<JsonRpc::Error::Code, std::string> torrentSetLocation(
     tr_session* session,
-    tr_variant::Map const& args_in,
-    tr_variant::Map& /*args_out*/)
+    std::string_view args_in,
+    std::string& /*args_out*/)
 {
     using namespace JsonRpc;
 
@@ -1769,7 +1522,7 @@ namespace make_torrent_field_helpers
 
 // ---
 
-void torrentRenamePath(tr_session* session, tr_variant::Map const& args_in, struct tr_rpc_idle_data* idle_data)
+void torrentRenamePath(tr_session* session, std::string_view args_in, struct tr_rpc_idle_data* idle_data)
 {
     using namespace JsonRpc;
 
@@ -1797,7 +1550,7 @@ void torrentRenamePath(tr_session* session, tr_variant::Map const& args_in, stru
             .path = oldpath,
             .name = newname,
         },
-        idle_data->args_out);
+        idle_data->result_json);
 
     tor->rename_path(
         oldpath,
@@ -1824,14 +1577,21 @@ void onPortTested(tr_web::FetchResponse const& web_response)
     auto const& [status, body, primary_ip, did_connect, did_timeout, user_data] = web_response;
     auto* data = static_cast<tr_rpc_idle_data*>(user_data);
 
-    if (auto const addr = tr_address::from_string(primary_ip);
-        !data->args_out.value_if<std::string_view>(TR_KEY_ip_protocol).has_value() && addr && addr->is_valid())
+    if (auto const addr = tr_address::from_string(primary_ip); !data->port_test_ip_protocol.has_value() && addr && addr->is_valid())
     {
-        data->args_out.try_emplace(TR_KEY_ip_protocol, addr->is_ipv4() ? "ipv4"sv : "ipv6"sv);
+        data->port_test_ip_protocol = addr->is_ipv4() ? tr::rpc::IpProtocol::make<"ipv4">() : tr::rpc::IpProtocol::make<"ipv6">();
     }
 
     if (status != 200)
     {
+        if (data->port_test_ip_protocol.has_value())
+        {
+            struct PortTestPartialResult
+            {
+                tr::rpc::IpProtocol ip_protocol;
+            };
+            write_rpc_result(PortTestPartialResult{ .ip_protocol = *data->port_test_ip_protocol }, data->result_json);
+        }
         tr_rpc_idle_done(
             data,
             Error::HTTP_ERROR,
@@ -1843,12 +1603,15 @@ void onPortTested(tr_web::FetchResponse const& web_response)
     }
 
     auto const port_is_open = tr_strv_starts_with(body, '1');
-    auto res = tr::rpc::PortTestResult{ .port_is_open = port_is_open };
-    write_rpc_result(res, data->args_out);
+    auto const res = tr::rpc::PortTestResult{
+        .ip_protocol = data->port_test_ip_protocol,
+        .port_is_open = port_is_open,
+    };
+    write_rpc_result(res, data->result_json);
     tr_rpc_idle_done(data, Error::SUCCESS, {});
 }
 
-void portTest(tr_session* session, tr_variant::Map const& args_in, struct tr_rpc_idle_data* idle_data)
+void portTest(tr_session* session, std::string_view args_in, struct tr_rpc_idle_data* idle_data)
 {
     using namespace JsonRpc;
 
@@ -1867,16 +1630,8 @@ void portTest(tr_session* session, tr_variant::Map const& args_in, struct tr_rpc
 
     if (auto const& val = params->ip_protocol.value(); val)
     {
-        if (val->str() == "ipv4"sv)
-        {
-            ip_proto = tr_web::FetchOptions::IPProtocol::V4;
-            idle_data->args_out.try_emplace(TR_KEY_ip_protocol, "ipv4"sv);
-        }
-        else
-        {
-            ip_proto = tr_web::FetchOptions::IPProtocol::V6;
-            idle_data->args_out.try_emplace(TR_KEY_ip_protocol, "ipv6"sv);
-        }
+        idle_data->port_test_ip_protocol = *val;
+        ip_proto = val->str() == "ipv4"sv ? tr_web::FetchOptions::IPProtocol::V4 : tr_web::FetchOptions::IPProtocol::V6;
     }
 
     auto options = tr_web::FetchOptions{
@@ -1979,11 +1734,11 @@ void onBlocklistFetched(tr_web::FetchResponse const& web_response)
         tr_rpc_idle_done(data, Error::INVALID_BLOCKLIST_DATA, {});
         return;
     }
-    write_rpc_result(tr::rpc::BlocklistUpdateResult{ .blocklist_size = static_cast<int64_t>(*blocklist_size) }, data->args_out);
+    write_rpc_result(tr::rpc::BlocklistUpdateResult{ .blocklist_size = static_cast<int64_t>(*blocklist_size) }, data->result_json);
     tr_rpc_idle_done(data, Error::SUCCESS, {});
 }
 
-void blocklistUpdate(tr_session* session, tr_variant::Map const& /*args_in*/, struct tr_rpc_idle_data* idle_data)
+void blocklistUpdate(tr_session* session, std::string_view /*args_in*/, struct tr_rpc_idle_data* idle_data)
 {
     session->fetch(
         {
@@ -2019,13 +1774,13 @@ void add_torrent_impl(struct tr_rpc_idle_data* data, tr_ctor& ctor)
 
     if (duplicate_of != nullptr)
     {
-        write_rpc_result(tr::rpc::TorrentAddResult{ .torrent_duplicate = make_summary(duplicate_of) }, data->args_out);
+        write_rpc_result(tr::rpc::TorrentAddResult{ .torrent_duplicate = make_summary(duplicate_of) }, data->result_json);
         tr_rpc_idle_done(data, Error::SUCCESS, {});
         return;
     }
 
     data->session->rpcNotify(TR_RPC_TORRENT_ADDED, tor->id());
-    write_rpc_result(tr::rpc::TorrentAddResult{ .torrent_added = make_summary(tor) }, data->args_out);
+    write_rpc_result(tr::rpc::TorrentAddResult{ .torrent_added = make_summary(tor) }, data->result_json);
     tr_rpc_idle_done(data, Error::SUCCESS, {});
 }
 
@@ -2090,7 +1845,7 @@ bool isCurlURL(std::string_view url)
     return files;
 }
 
-void torrentAdd(tr_session* session, tr_variant::Map const& args_in, tr_rpc_idle_data* idle_data)
+void torrentAdd(tr_session* session, std::string_view args_in, tr_rpc_idle_data* idle_data)
 {
     using namespace JsonRpc;
 
@@ -2240,8 +1995,8 @@ void torrentAdd(tr_session* session, tr_variant::Map const& args_in, tr_rpc_idle
 
 [[nodiscard]] std::pair<JsonRpc::Error::Code, std::string> groupGet(
     tr_session* session,
-    tr_variant::Map const& args_in,
-    tr_variant::Map& args_out)
+    std::string_view args_in,
+    std::string& args_out)
 {
     auto const params = parse_rpc_params<tr::rpc::GroupGetParams>(args_in);
     if (!params)
@@ -2295,8 +2050,8 @@ void torrentAdd(tr_session* session, tr_variant::Map const& args_in, tr_rpc_idle
 
 [[nodiscard]] std::pair<JsonRpc::Error::Code, std::string> groupSet(
     tr_session* session,
-    tr_variant::Map const& args_in,
-    tr_variant::Map& /*args_out*/)
+    std::string_view args_in,
+    std::string& /*args_out*/)
 {
     using namespace JsonRpc;
 
@@ -2350,8 +2105,8 @@ void torrentAdd(tr_session* session, tr_variant::Map const& args_in, tr_rpc_idle
 
 [[nodiscard]] std::pair<JsonRpc::Error::Code, std::string> sessionStats(
     tr_session* session,
-    tr_variant::Map const& /*args_in*/,
-    tr_variant::Map& args_out)
+    std::string_view /*args_in*/,
+    std::string& args_out)
 {
     auto const make_stats = [](auto const& stats)
     {
@@ -3055,10 +2810,10 @@ using SessionAccessors = std::pair<SessionGetter, SessionSetter>;
 
 [[nodiscard]] std::pair<JsonRpc::Error::Code, std::string> sessionSet(
     tr_session* session,
-    tr_variant::Map const& params,
-    tr_variant::Map& /*result*/)
+    std::string_view raw_params,
+    std::string& /*result*/)
 {
-    auto const parsed = parse_rpc_params<tr::rpc::SessionSetParams>(params);
+    auto const parsed = parse_rpc_params<tr::rpc::SessionSetParams>(raw_params);
     if (!parsed)
     {
         return { tr::rpc::classify_params_error(parsed.error().kind()), parsed.error().what() };
@@ -3068,19 +2823,29 @@ using SessionAccessors = std::pair<SessionGetter, SessionSetter>;
 
     auto err = error_none;
 
-    for (auto const& [key, val] : params)
+    if (!std::empty(raw_params))
     {
-        if (auto const iter = accessors.find(key); iter != std::end(accessors))
+        auto serde = tr_variant_serde::json().inplace();
+        if (auto params_var = serde.parse(raw_params); params_var)
         {
-            if (auto const& [getter, setter] = iter->second; setter)
+            if (auto const* params = params_var->get_if<tr_variant::Map>(); params != nullptr)
             {
-                setter(*session, val, err);
-            }
-        }
+                for (auto const& [key, val] : *params)
+                {
+                    if (auto const iter = accessors.find(key); iter != std::end(accessors))
+                    {
+                        if (auto const& [getter, setter] = iter->second; setter)
+                        {
+                            setter(*session, val, err);
+                        }
+                    }
 
-        if (err != error_none)
-        {
-            break;
+                    if (err != error_none)
+                    {
+                        break;
+                    }
+                }
+            }
         }
     }
 
@@ -3090,16 +2855,17 @@ using SessionAccessors = std::pair<SessionGetter, SessionSetter>;
 
 [[nodiscard]] std::pair<JsonRpc::Error::Code, std::string> sessionGet(
     tr_session* session,
-    tr_variant::Map const& params,
-    tr_variant::Map& result)
+    std::string_view raw_params,
+    std::string& result_json)
 {
-    auto const parsed = parse_rpc_params<tr::rpc::SessionGetParams>(params);
+    auto const parsed = parse_rpc_params<tr::rpc::SessionGetParams>(raw_params);
     if (!parsed)
     {
         return { tr::rpc::classify_params_error(parsed.error().kind()), parsed.error().what() };
     }
 
     auto const& accessors = session_accessors();
+    auto result = tr_variant::Map{};
 
     for (auto const key : get_session_fields(parsed->fields.value()))
     {
@@ -3112,13 +2878,14 @@ using SessionAccessors = std::pair<SessionGetter, SessionSetter>;
         }
     }
 
+    result_json = tr_variant_serde::json().compact().to_string(tr_variant{ std::move(result) });
     return error_none;
 }
 
 [[nodiscard]] std::pair<JsonRpc::Error::Code, std::string> freeSpace(
     tr_session* /*session*/,
-    tr_variant::Map const& args_in,
-    tr_variant::Map& args_out)
+    std::string_view args_in,
+    std::string& args_out)
 {
     using namespace JsonRpc;
 
@@ -3158,8 +2925,8 @@ using SessionAccessors = std::pair<SessionGetter, SessionSetter>;
 
 [[nodiscard]] std::pair<JsonRpc::Error::Code, std::string> sessionClose(
     tr_session* session,
-    tr_variant::Map const& /*args_in*/,
-    tr_variant::Map& /*args_out*/)
+    std::string_view /*args_in*/,
+    std::string& /*args_out*/)
 {
     session->rpcNotify(TR_RPC_SESSION_CLOSE);
     return { JsonRpc::Error::SUCCESS, std::string{} };
@@ -3167,7 +2934,7 @@ using SessionAccessors = std::pair<SessionGetter, SessionSetter>;
 
 // ---
 
-using SyncHandler = std::pair<JsonRpc::Error::Code, std::string> (*)(tr_session*, tr_variant::Map const&, tr_variant::Map&);
+using SyncHandler = std::pair<JsonRpc::Error::Code, std::string> (*)(tr_session*, std::string_view, std::string&);
 
 auto const sync_handlers = small::max_size_map<tr_quark, std::pair<SyncHandler, bool /*has_side_effects*/>, 20U>{ {
     { TR_KEY_free_space, { freeSpace, false } },
@@ -3192,7 +2959,7 @@ auto const sync_handlers = small::max_size_map<tr_quark, std::pair<SyncHandler, 
     { TR_KEY_torrent_verify, { torrentVerify, true } },
 } };
 
-using AsyncHandler = void (*)(tr_session*, tr_variant::Map const&, tr_rpc_idle_data*);
+using AsyncHandler = void (*)(tr_session*, std::string_view, tr_rpc_idle_data*);
 
 auto const async_handlers = small::max_size_map<tr_quark, std::pair<AsyncHandler, bool /*has_side_effects*/>, 4U>{ {
     { TR_KEY_blocklist_update, { blocklistUpdate, true } },
@@ -3200,10 +2967,6 @@ auto const async_handlers = small::max_size_map<tr_quark, std::pair<AsyncHandler
     { TR_KEY_torrent_add, { torrentAdd, true } },
     { TR_KEY_torrent_rename_path, { torrentRenamePath, true } },
 } };
-
-void noop_response_callback(tr_variant&& /*response*/)
-{
-}
 
 void noop_json_response_callback(std::string&& /*response*/)
 {
@@ -3239,11 +3002,11 @@ void noop_json_response_callback(std::string&& /*response*/)
     return err.what();
 }
 
-void dispatch_method(tr_session* session, tr_quark const method_key, tr_variant::Map const& params, tr_rpc_idle_data* data)
+void dispatch_method(tr_session* session, tr_quark const method_key, std::string_view const raw_params, tr_rpc_idle_data* data)
 {
     using namespace JsonRpc;
 
-    auto const is_notification = data->is_jsonrpc && (data->json_callback ? data->rpc_id.is_notification() : !data->id.has_value());
+    auto const is_notification = data->rpc_id.is_notification();
 
     if (auto const handler = async_handlers.find(method_key); handler != std::end(async_handlers))
     {
@@ -3254,7 +3017,7 @@ void dispatch_method(tr_session* session, tr_quark const method_key, tr_variant:
             return;
         }
 
-        func(session, params, data);
+        func(session, raw_params, data);
         return;
     }
 
@@ -3267,7 +3030,7 @@ void dispatch_method(tr_session* session, tr_quark const method_key, tr_variant:
             return;
         }
 
-        auto const [err, errmsg] = func(session, params, data->args_out);
+        auto const [err, errmsg] = func(session, raw_params, data->result_json);
         tr_rpc_idle_done(data, err, errmsg);
         return;
     }
@@ -3276,85 +3039,71 @@ void dispatch_method(tr_session* session, tr_quark const method_key, tr_variant:
     tr_rpc_idle_done(data, Error::METHOD_NOT_FOUND, {});
 }
 
-void tr_rpc_request_exec_impl(tr_session* session, tr_variant& request, tr_rpc_response_func&& callback, bool is_batch)
-{
-    using namespace JsonRpc;
+void exec_single_json_request(
+    tr_session* session,
+    std::string_view raw_json,
+    tr_rpc_json_response_func&& callback,
+    bool is_batch,
+    bool allow_legacy = true);
 
-    if (!callback)
+// Thin edge adapter for legacy Transmission 4.x RPC requests (no "jsonrpc" field):
+// translates Tr4 -> JSON-RPC 2.0 on entry, reuses the single reflect-cpp pipeline,
+// and translates the JSON-RPC 2.0 response back to Tr4 on exit.
+void exec_legacy_tr4_json_request(tr_session* session, std::string_view raw_json, tr_rpc_json_response_func&& callback)
+{
+    auto serde = tr_variant_serde::json().inplace();
+    auto legacy_var = serde.parse(raw_json);
+    if (!legacy_var)
     {
-        callback = noop_response_callback;
+        callback(build_json_error_response(JsonRpc::Error::PARSE_ERROR, tr::rpc::RequestId::null_id(), serde.error_.message()));
+        return;
     }
 
-    auto const* map = request.get_if<tr_variant::Map>();
+    tr::api_compat::convert_incoming_data(*legacy_var);
+    auto* const map = legacy_var->get_if<tr_variant::Map>();
     if (map == nullptr)
     {
-        callback(build_response(
-            Error::INVALID_REQUEST,
-            nullptr,
-            Error::build_data(is_batch ? "request must be an Object"sv : "request must be an Array or Object"sv, {})));
+        callback(R"({"arguments":{},"result":"bug in api-compat, please report a bug at https://github.com/transmission/transmission/issues"})");
         return;
     }
 
-    auto is_jsonrpc = false;
-    if (auto jsonrpc = map->value_if<std::string_view>(TR_KEY_jsonrpc); jsonrpc == Version)
+    // Legacy Tr4 requests without "tag" still expect a response (unlike JSON-RPC 2.0 notifications).
+    // api_compat::convert(resp, Style::Tr4) strips non-integer "id" back off on exit.
+    if (!map->contains(TR_KEY_id))
     {
-        is_jsonrpc = true;
+        map->try_emplace(TR_KEY_id, nullptr);
     }
-    else if (jsonrpc || is_batch)
-    {
-        callback(build_response(Error::INVALID_REQUEST, nullptr, Error::build_data("JSON-RPC version is not 2.0"sv, {})));
-        return;
-    }
-    else
-    {
-        tr::api_compat::convert_incoming_data(request);
-        map = request.get_if<tr_variant::Map>();
-        TR_ASSERT(map != nullptr);
-        if (map == nullptr)
+
+    auto const converted = tr_variant_serde::json().compact().to_string(*legacy_var);
+    exec_single_json_request(
+        session,
+        converted,
+        [cb = std::move(callback)](std::string&& jsonrpc_resp)
         {
-            auto response = tr_variant::Map{ 2U };
-            response.try_emplace(TR_KEY_arguments, tr_variant::Map{});
-            response.try_emplace(
-                TR_KEY_result,
-                tr_variant::unmanaged_string(
-                    "bug in api-compat, please report a bug at https://github.com/transmission/transmission/issues"sv));
-            callback(std::move(response));
-            return;
-        }
-    }
-
-    auto const empty_params = tr_variant::Map{};
-    auto const* params = map->find_if<tr_variant::Map>(TR_KEY_params);
-    if (params == nullptr)
-    {
-        params = &empty_params;
-    }
-
-    auto const method_name = map->value_if<std::string_view>(TR_KEY_method).value_or(""sv);
-    auto const method_key = tr_quark_new(method_name);
-
-    auto* const data = new tr_rpc_idle_data{};
-    data->session = session;
-    data->is_jsonrpc = is_jsonrpc;
-    data->callback = std::move(callback);
-
-    if (auto iter = map->find(TR_KEY_id); iter != std::end(*map))
-    {
-        auto parsed_id = rfl::from_generic<tr::rpc::RequestId>(tr_variant_to_rfl_generic(iter->second));
-        if (!parsed_id)
-        {
-            data->id = nullptr;
-            tr_rpc_idle_done(data, tr::rpc::classify_envelope_error(parsed_id.error().kind()), parsed_id.error().what());
-            return;
-        }
-        data->rpc_id = *parsed_id;
-        data->id = request_id_to_tr_variant(*parsed_id);
-    }
-
-    dispatch_method(session, method_key, *params, data);
+            if (std::empty(jsonrpc_resp))
+            {
+                cb(std::string{});
+                return;
+            }
+            auto resp_serde = tr_variant_serde::json().inplace();
+            if (auto resp_var = resp_serde.parse(jsonrpc_resp); resp_var)
+            {
+                tr::api_compat::convert(*resp_var, tr::api_compat::Style::Tr4);
+                cb(tr_variant_serde::json().compact().to_string(*resp_var));
+                return;
+            }
+            cb(std::move(jsonrpc_resp));
+        },
+        false,
+        false);
 }
 
-void exec_single_json_request(tr_session* session, std::string_view raw_json, tr_rpc_json_response_func&& callback, bool is_batch)
+void exec_single_json_request(
+    tr_session* session,
+    std::string_view raw_json,
+    tr_rpc_json_response_func&& callback,
+    bool is_batch,
+    bool allow_legacy)
 {
     using namespace JsonRpc;
 
@@ -3363,65 +3112,45 @@ void exec_single_json_request(tr_session* session, std::string_view raw_json, tr
         callback = noop_json_response_callback;
     }
 
-    auto raw_obj = rfl::json::read<rfl::Object<rfl::json::Raw>>(raw_json);
-    if (!raw_obj)
-    {
-        auto const code = tr::rpc::classify_envelope_error(raw_obj.error().kind());
-        if (code == Error::PARSE_ERROR)
-        {
-            callback(build_json_error_response(Error::PARSE_ERROR, tr::rpc::RequestId::null_id(), raw_obj.error().what()));
-        }
-        else
-        {
-            callback(build_json_error_response(
-                Error::INVALID_REQUEST,
-                tr::rpc::RequestId::null_id(),
-                is_batch ? "request must be an Object"sv : "request must be an Array or Object"sv));
-        }
-        return;
-    }
-
-    if (!is_batch && !raw_obj->get("jsonrpc").has_value())
-    {
-        // Legacy Transmission 4.x RPC request (no "jsonrpc" field): convert via api-compat.
-        auto serde = tr_variant_serde::json().inplace();
-        if (auto legacy_var = serde.parse(raw_json); legacy_var)
-        {
-            tr_rpc_request_exec_impl(
-                session,
-                *legacy_var,
-                [cb = std::move(callback)](tr_variant&& resp)
-                {
-                    if (!resp.has_value())
-                    {
-                        cb(std::string{});
-                        return;
-                    }
-                    cb(tr_variant_serde::json().compact().to_string(resp));
-                },
-                false);
-            return;
-        }
-
-        callback(build_json_error_response(Error::PARSE_ERROR, tr::rpc::RequestId::null_id(), serde.error_.message()));
-        return;
-    }
-
     auto env = rfl::json::read<tr::rpc::JsonRpcRequestEnvelope>(raw_json);
     if (!env)
     {
+        auto raw_obj = rfl::json::read<rfl::Object<rfl::json::Raw>>(raw_json);
+        if (!raw_obj)
+        {
+            auto const code = tr::rpc::classify_envelope_error(raw_obj.error().kind());
+            if (code == Error::PARSE_ERROR)
+            {
+                callback(build_json_error_response(Error::PARSE_ERROR, tr::rpc::RequestId::null_id(), raw_obj.error().what()));
+            }
+            else
+            {
+                callback(build_json_error_response(
+                    Error::INVALID_REQUEST,
+                    tr::rpc::RequestId::null_id(),
+                    is_batch ? "request must be an Object"sv : "request must be an Array or Object"sv));
+            }
+            return;
+        }
+
+        if (allow_legacy && !is_batch && !raw_obj->get("jsonrpc").has_value())
+        {
+            exec_legacy_tr4_json_request(session, raw_json, std::move(callback));
+            return;
+        }
+
         auto const code = tr::rpc::classify_envelope_error(env.error().kind());
         callback(build_json_error_response(code, tr::rpc::RequestId::null_id(), format_envelope_error_string(env.error())));
         return;
     }
 
-    auto params_map = tr_variant::Map{};
+    auto raw_params_sv = std::string_view{};
     if (auto const& raw_params = env->params.value(); raw_params)
     {
-        auto parsed_params = rfl::json::read<rfl::Generic::Object>(raw_params->str());
-        if (!parsed_params)
+        raw_params_sv = raw_params->str();
+        // Verify params is a JSON object (not scalar/array) per Transmission RPC spec
+        if (!rfl::json::read<rfl::Object<rfl::json::Raw>>(raw_params_sv))
         {
-            auto const code = tr::rpc::classify_params_error(parsed_params.error().kind());
             auto const& id = env->id.value().get();
             if (id.is_notification())
             {
@@ -3429,26 +3158,19 @@ void exec_single_json_request(tr_session* session, std::string_view raw_json, tr
             }
             else
             {
-                callback(build_json_error_response(code, id, parsed_params.error().what()));
+                callback(build_json_error_response(Error::INVALID_PARAMS, id, "params must be an Object"sv));
             }
             return;
-        }
-
-        auto params_var = rfl_generic_to_tr_variant(rfl::Generic{ std::move(*parsed_params) });
-        if (auto* map_ptr = params_var.get_if<tr_variant::Map>(); map_ptr != nullptr)
-        {
-            params_map = std::move(*map_ptr);
         }
     }
 
     auto* const data = new tr_rpc_idle_data{};
     data->session = session;
-    data->is_jsonrpc = true;
     data->rpc_id = env->id.value().get();
     data->json_callback = std::move(callback);
 
     auto const method_key = tr_quark_new(env->method.value());
-    dispatch_method(session, method_key, params_map, data);
+    dispatch_method(session, method_key, raw_params_sv, data);
 }
 
 void exec_json_batch(tr_session* session, std::vector<rfl::json::Raw> const& requests, tr_rpc_json_response_func&& callback)
@@ -3493,53 +3215,7 @@ void exec_json_batch(tr_session* session, std::vector<rfl::json::Raw> const& req
             true);
     }
 }
-
-void tr_rpc_request_exec_batch(tr_session* session, tr_variant::Vector& requests, tr_rpc_response_func&& callback)
-{
-    auto const n_requests = std::size(requests);
-    auto responses = std::make_shared<tr_variant::Vector>(n_requests);
-    auto n_responses = std::make_shared<size_t>();
-    auto cb = std::make_shared<tr_rpc_response_func>(std::move(callback));
-
-    for (size_t i = 0U; i < n_requests; ++i)
-    {
-        tr_rpc_request_exec_impl(
-            session,
-            requests[i],
-            [responses, n_requests, n_responses, i, cb](tr_variant&& response)
-            {
-                (*responses)[i] = std::move(response);
-
-                if (++(*n_responses) >= n_requests)
-                {
-                    // Remove notifications from reply
-                    auto const it_end = std::remove_if(
-                        std::begin(*responses),
-                        std::end(*responses),
-                        [](auto const& r) { return !r.has_value(); });
-                    responses->erase(it_end, std::end(*responses));
-
-                    (*cb)(!std::empty(*responses) ? std::move(*responses) : tr_variant{});
-                }
-            },
-            true);
-    }
-}
 } // namespace
-
-// TODO(tearfur): take `tr_variant const& request` after removing api_compat
-void tr_rpc_request_exec(tr_session* session, tr_variant& request, tr_rpc_response_func&& callback)
-{
-    auto const lock = session->unique_lock();
-
-    if (auto* const vec = request.get_if<tr_variant::Vector>(); vec != nullptr)
-    {
-        tr_rpc_request_exec_batch(session, *vec, std::move(callback));
-        return;
-    }
-
-    tr_rpc_request_exec_impl(session, request, std::move(callback), false);
-}
 
 void tr_rpc_request_exec_json(tr_session* session, std::string_view request, tr_rpc_json_response_func&& callback)
 {
@@ -3582,16 +3258,15 @@ void tr_rpc_request_exec_json(tr_session* session, std::string_view request, tr_
 
 void tr_rpc_request_exec(tr_session* session, std::string_view request, tr_rpc_response_func&& callback)
 {
-    if (!callback)
-    {
-        callback = noop_response_callback;
-    }
-
     tr_rpc_request_exec_json(
         session,
         request,
         [cb = std::move(callback)](std::string&& response_json)
         {
+            if (!cb)
+            {
+                return;
+            }
             if (std::empty(response_json))
             {
                 cb({});
@@ -3605,4 +3280,11 @@ void tr_rpc_request_exec(tr_session* session, std::string_view request, tr_rpc_r
             }
             cb({});
         });
+}
+
+// Thin edge adapter for callers (unit tests) passing a pre-built tr_variant request
+void tr_rpc_request_exec(tr_session* session, tr_variant& request, tr_rpc_response_func&& callback)
+{
+    auto const json = tr_variant_serde::json().compact().to_string(request);
+    tr_rpc_request_exec(session, json, std::move(callback));
 }
